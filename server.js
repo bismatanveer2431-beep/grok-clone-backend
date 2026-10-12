@@ -747,10 +747,37 @@ app.post("/api/chat", async (req, res) => {
   }
 
   let clientDisconnected = false;
+  let responseEndedByUs = false;
 
-  req.on("close", () => {
-    clientDisconnected = true;
+  // NOTE: with Express 4 on Node 16+, "close" fires on the REQUEST object as
+  // soon as the request body has been fully parsed — the client is still
+  // connected. Listening for it here used to flag every chat as "disconnected"
+  // before a single token was sent, so the SSE stream stayed empty and the
+  // app showed "Couldn't reach the AI". Detect real disconnects from the
+  // RESPONSE stream instead, and only when we didn't end it ourselves.
+  res.on("close", () => {
+    if (!responseEndedByUs && !res.writableFinished) {
+      clientDisconnected = true;
+    }
   });
+
+  // Safety net: if the upstream model stalls, don't hold the connection open
+  // forever — emit an error event and close so the client can recover.
+  // The timer resets on every token, so long answers are still allowed.
+  let streamTimeout;
+  const resetStreamTimeout = () => {
+    clearTimeout(streamTimeout);
+    streamTimeout = setTimeout(() => {
+      if (!responseEndedByUs && !res.writableEnded) {
+        console.error("❌ CHAT STREAM TIMED OUT (60s of inactivity)");
+        sendSSE(res, { error: "The AI took too long to respond. Please try again." });
+        responseEndedByUs = true;
+        res.end();
+      }
+    }, 60000);
+  };
+  resetStreamTimeout();
+  res.on("finish", () => clearTimeout(streamTimeout));
 
   try {
     const requestOptions = {
@@ -794,6 +821,7 @@ app.post("/api/chat", async (req, res) => {
       if (!cleaned) continue;
 
       sendSSE(res, { token: cleaned });
+      resetStreamTimeout();
     }
 
     // Flush any remaining buffered text at end of stream
@@ -806,6 +834,7 @@ app.post("/api/chat", async (req, res) => {
 
     if (!clientDisconnected && !res.writableEnded) {
       sendSSE(res, { done: true, model });
+      responseEndedByUs = true;
       res.end();
     }
 
@@ -817,6 +846,7 @@ app.post("/api/chat", async (req, res) => {
       sendSSE(res, {
         error: error?.message || "Failed to generate response.",
       });
+      responseEndedByUs = true;
       res.end();
     }
   }
