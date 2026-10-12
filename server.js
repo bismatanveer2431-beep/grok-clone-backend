@@ -690,6 +690,16 @@ app.post("/api/chat", async (req, res) => {
     });
   }
 
+  // Guardrail: only send the last N turns to the model. The full chat is
+  // still stored on-device and in Supabase, but we cap what hits Groq so a
+  // long conversation can't blow past the free-tier per-request token limit
+  // (Groq returns HTTP 413 "Request too large" when it does).
+  const MAX_HISTORY_TURNS = 20;
+  const recentMessages =
+    validMessages.length > MAX_HISTORY_TURNS
+      ? validMessages.slice(-MAX_HISTORY_TURNS)
+      : validMessages;
+
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
@@ -703,21 +713,28 @@ app.post("/api/chat", async (req, res) => {
     typeof imageUrl === "string" &&
     imageUrl.trim().length > 0;
 
+  // Models chosen for this Groq account's available catalog + free-tier caps:
+  //   - openai/gpt-oss-20b: same family as the previous 120b but with a much
+  //     larger per-request input budget, so our big system prompt + 20-turn
+  //     history no longer triggers Groq's HTTP 413 "Request too large".
+  //   - qwen/qwen3.8-27b: the vision model actually available on this key
+  //     (previous value "qwen/qwen3.6-27b" was a wrong version string and
+  //     returned model_not_found).
   const model = hasImage
-    ? "qwen/qwen3.6-27b"
-    : "openai/gpt-oss-120b";
+    ? "qwen/qwen3.8-27b"
+    : "openai/gpt-oss-20b";
 
   let formattedMessages = [
     {
       role: "system",
       content: BISMA_SYSTEM_PROMPT,
     },
-    ...validMessages,
+    ...recentMessages,
   ];
 
   if (hasImage) {
-    const lastMessage = validMessages[validMessages.length - 1];
-    const previousMessages = validMessages.slice(0, -1);
+    const lastMessage = recentMessages[recentMessages.length - 1];
+    const previousMessages = recentMessages.slice(0, -1);
 
     formattedMessages = [
       {
@@ -786,14 +803,14 @@ app.post("/api/chat", async (req, res) => {
       stream: true,
       temperature: hasImage ? 0.6 : 0.3,
       top_p: 0.95,
-      max_completion_tokens: hasImage ? 16384 : 32768,
-      reasoning_format: "hidden",
+      max_completion_tokens: hasImage ? 8192 : 4096,
     };
 
-    if (model === "openai/gpt-oss-120b") {
-      requestOptions.reasoning_effort = "medium";
-    } else {
-      requestOptions.reasoning_effort = "default";
+    // gpt-oss reasoning models support a hidden reasoning trace; other
+    // models (qwen vision) reject these fields, so only add them when needed.
+    if (model.startsWith("openai/gpt-oss")) {
+      requestOptions.reasoning_format = "hidden";
+      requestOptions.reasoning_effort = "low";
     }
 
     const stream = await groq.chat.completions.create(requestOptions);
